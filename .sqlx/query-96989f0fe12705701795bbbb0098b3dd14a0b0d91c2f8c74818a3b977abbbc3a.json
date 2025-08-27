@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO user_avatars (\n                    user_id,\n                    pixels\n                )\n                VALUES ($1, $2)\n                ON CONFLICT (user_id) DO UPDATE\n                SET\n                    pixels = EXCLUDED.pixels,\n                    updated_at = NOW()\n                RETURNING *\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "pixels",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "96989f0fe12705701795bbbb0098b3dd14a0b0d91c2f8c74818a3b977abbbc3a"
+}

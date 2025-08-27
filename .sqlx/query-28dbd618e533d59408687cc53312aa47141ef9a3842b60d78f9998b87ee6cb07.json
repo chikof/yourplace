@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO pixels (x, y, user_id, color)\n                    VALUES ($1, $2, $3, $4)\n                    ON CONFLICT (x, y) DO UPDATE SET\n                        user_id = $3,\n                        color = $4,\n                        placed_at = NOW()\n                    RETURNING x, y, user_id, color\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "x",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "y",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "color",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "28dbd618e533d59408687cc53312aa47141ef9a3842b60d78f9998b87ee6cb07"
+}

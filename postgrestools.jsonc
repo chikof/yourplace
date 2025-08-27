@@ -1,0 +1,21 @@
+{
+    "$schema": "https://pgtools.dev/0.10.0/schema.json",
+    "extends": [],
+    "files": {
+        "ignore": []
+    },
+    "linter": {
+        "enabled": true,
+        "rules": {
+            "recommended": true
+        }
+    },
+    "db": {
+        "host": "127.0.0.1",
+        "port": 5432,
+        "username": "postgres",
+        "password": "postgres",
+        "database": "postgres",
+        "connTimeoutSecs": 10
+    }
+}
