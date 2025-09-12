@@ -22,6 +22,16 @@
         "ordinal": 3,
         "name": "created_at",
         "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 4,
+        "name": "level",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "xp",
+        "type_info": "Int4"
       }
     ],
     "parameters": {
@@ -31,6 +41,8 @@
       ]
     },
     "nullable": [
+      false,
+      false,
       false,
       false,
       false,

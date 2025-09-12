@@ -10,6 +10,8 @@ use crate::utils::error::{DatabaseError, ModelResult};
 pub struct UserModel {
     id: Uuid,
     username: String,
+    level: i32,
+    xp: i32,
     email: String,
     created_at: NaiveDateTime,
 }
@@ -23,11 +25,15 @@ pub struct UserCreation {
 #[derive(serde::Deserialize)]
 pub struct UserUpdate {
     username: Option<String>,
+    level: Option<i32>,
+    xp: Option<i32>,
 }
 
 #[derive(Serialize)]
 pub struct UserResult {
     id: String,
+    level: i32,
+    xp: i32,
     username: String,
     created_at: NaiveDateTime,
 }
@@ -76,12 +82,16 @@ impl UserModel {
             r#"
                 UPDATE users
                 SET
-                    username = COALESCE($1, username)
+                    username = COALESCE($1, username),
+                    level = COALESCE($2, level),
+                    xp = COALESCE($3, xp)
                 WHERE
-                    id = $2
+                    id = $4
                 RETURNING *
             "#,
             update.username,
+            update.level,
+            update.xp,
             self.id
         )
         .fetch_optional(db!())
@@ -93,6 +103,8 @@ impl UserModel {
         UserResult {
             id: self.id.into(),
             username: self.username.clone(),
+            level: self.level,
+            xp: self.xp,
             created_at: self.created_at,
         }
     }
