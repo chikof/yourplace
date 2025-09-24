@@ -220,9 +220,9 @@ dependencies = [
 
 [[package]]
 name = "actix_failwrap"
-version = "1.0.1"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8401a7fa67db7fe9e6be2d377ba797d444b2b59f21c3dbeec4d0488b2b7397e8"
+checksum = "1711e2f60fa5728bd5a56da023a7e43b4f43ac4d12b5613e0bf0b972bf09147e"
 dependencies = [
  "proc-macro2",
  "quote",
