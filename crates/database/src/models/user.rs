@@ -1,5 +1,5 @@
 use chrono::NaiveDateTime;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, query_as};
 use uuid::Uuid;
 
@@ -12,14 +12,15 @@ pub struct UserModel {
     username: String,
     level: i32,
     xp: i32,
+    coins: i64,
     email: String,
     created_at: NaiveDateTime,
 }
 
 #[derive(Deserialize)]
 pub struct UserCreation {
-    username: String,
-    email: String,
+    pub username: String,
+    pub email: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -34,6 +35,7 @@ pub struct UserResult {
     id: String,
     level: i32,
     xp: i32,
+    coins: i64,
     username: String,
     created_at: NaiveDateTime,
 }
@@ -57,6 +59,26 @@ impl UserModel {
         .await?;
 
         Ok(user)
+    }
+
+    pub async fn get_by_email(email: &str) -> ModelResult<Option<Self>> {
+        let user = query_as!(
+            Self,
+            r#"
+                SELECT *
+                FROM users
+                WHERE email = $1
+            "#,
+            email
+        )
+        .fetch_optional(db!())
+        .await?;
+
+        Ok(user)
+    }
+
+    pub fn id(&self) -> String {
+        self.id.to_string()
     }
 
     pub async fn get(id: String) -> ModelResult<Self> {
@@ -105,6 +127,7 @@ impl UserModel {
             username: self.username.clone(),
             level: self.level,
             xp: self.xp,
+            coins: self.coins,
             created_at: self.created_at,
         }
     }

@@ -10,7 +10,12 @@ actix_failwrap.workspace = true
 flexi_logger.workspace = true
 oauth2 = "5.0.0"
 actix-identity = "0.8.0"
+actix-session = { version = "0.10.1", features = ["cookie-session"] }
 eserde.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+
+serde.workspace = true
 
 [dependencies.macros_utils]
 path = "../crates/macros_utils"

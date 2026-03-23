@@ -1,0 +1,1474 @@
+#/bin/sh
+
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/Cargo.toml b/Cargo.toml
+index 19d4b7014000199418998ecdf018fd45718b4eaf..2c3d1b5fb9a5a0f6f2efc72b0deb0c40d1742bec 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,26 +1,30 @@
+ [workspace]
+ resolver = "2"
+ members = ["crates/*", "server"]
+ 
+ [workspace.dependencies]
+ # Misc
+ dotenvy = "0.15.7"
+ chrono = { version = "0.4.41", features = ["serde"] }
+ thiserror = "2.0.15"
++uuid = { version = "1.10.0", features = ["v4", "v5", "serde"] }
++
++# Networking
++reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+ 
+ # Serde
+ eserde = { version = "0.1.7", features = ["json"] }
+ serde = "1.0.219"
+ 
+ # Database
+ sqlx = { version = "0.8.6", features = [
+     "chrono",
+     "postgres",
+     "runtime-tokio",
+     "uuid",
+ ] }
+ 
+ # Server
+ actix-web = "4.11.0"
+ flexi_logger = "0.31.2"
+ actix_failwrap = "1.0.1"
+diff --git a/crates/database/Cargo.toml b/crates/database/Cargo.toml
+index bab136b22536e93e89ed2a11fbadcaf2421574c8..f11ce9e3f73e9508afab619bc6a164fe86e929eb 100644
+--- a/crates/database/Cargo.toml
++++ b/crates/database/Cargo.toml
+@@ -1,20 +1,20 @@
+ [package]
+ name = "database"
+ version = "0.1.0"
+ edition = "2024"
+ 
+ [dependencies]
+ sqlx.workspace = true
+ thiserror.workspace = true
+ eserde.workspace = true
+ serde.workspace = true
+ chrono.workspace = true
+ actix-web.workspace = true
+ actix_failwrap.workspace = true
+-uuid = "1.18.0"
++uuid.workspace = true
+ serde_json = "1.0.143"
+ 
+ [dependencies.macros_utils]
+ path = "../macros_utils"
+ default-features = false
+ features = ["ternary"]
+diff --git a/crates/database/src/models/coins.rs b/crates/database/src/models/coins.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..163cbd5df01868cd87d38afd43f6b93a04e11b2c
+--- /dev/null
++++ b/crates/database/src/models/coins.rs
+@@ -0,0 +1,142 @@
++use chrono::NaiveDateTime;
++use serde::{Deserialize, Serialize};
++use sqlx::{FromRow, Postgres, Transaction, query, query_as};
++use uuid::Uuid;
++
++use crate::db;
++use crate::utils::error::{DatabaseError, ModelResult};
++
++#[derive(FromRow, Serialize)]
++pub struct CoinTransactionResult {
++    pub id: String,
++    pub user_id: String,
++    pub amount: i64,
++    pub source: String,
++    pub reference: Option<String>,
++    pub created_at: NaiveDateTime,
++}
++
++#[derive(Deserialize)]
++pub struct PurchaseCoinsRequest {
++    pub coins: i32,
++    pub payment_reference: Option<String>,
++}
++
++impl CoinTransactionResult {
++    pub async fn apply_purchase(
++        user_id: &str,
++        request: PurchaseCoinsRequest,
++    ) -> ModelResult<(Self, i64)> {
++        if request.coins <= 0 {
++            return Err(DatabaseError::InvalidInput("coins must be greater than zero"));
++        }
++
++        let mut tx = db!().begin().await?;
++        let user_uuid = Uuid::parse_str(user_id)?;
++        let balance = Self::increment_balance(&mut tx, &user_uuid, request.coins).await?;
++        let transaction = Self::record_transaction(
++            &mut tx,
++            &user_uuid,
++            request.coins,
++            "purchase",
++            request.payment_reference,
++        )
++        .await?;
++        tx.commit().await?;
++        Ok((transaction, balance))
++    }
++
++    pub async fn reward_pixels_in_tx(
++        tx: &mut Transaction<'_, Postgres>,
++        user_id: &Uuid,
++        reward: i32,
++        reference: Option<String>,
++    ) -> ModelResult<i64> {
++        let balance = Self::increment_balance(tx, user_id, reward).await?;
++        let _ = Self::record_transaction(tx, user_id, reward, "placement", reference).await?;
++        Ok(balance)
++    }
++
++    pub async fn list_for_user(user_id: &str) -> ModelResult<Vec<Self>> {
++        let transactions = query_as!(
++            Self,
++            r#"
++                SELECT id::text, user_id::text, amount, source, reference, created_at
++                FROM coin_transactions
++                WHERE user_id = $1
++                ORDER BY created_at DESC
++            "#,
++            Uuid::parse_str(user_id)?
++        )
++        .fetch_all(db!())
++        .await?;
++
++        Ok(transactions)
++    }
++
++    pub async fn balance_for_user(user_id: &str) -> ModelResult<i64> {
++        let record = query!(
++            r#"
++                SELECT coins
++                FROM users
++                WHERE id = $1
++            "#,
++            Uuid::parse_str(user_id)?
++        )
++        .fetch_one(db!())
++        .await?;
++
++        Ok(record.coins)
++    }
++
++    async fn increment_balance(
++        tx: &mut Transaction<'_, Postgres>,
++        user_id: &Uuid,
++        delta: i32,
++    ) -> ModelResult<i64> {
++        let record = query!(
++            r#"
++                UPDATE users
++                SET coins = coins + $1
++                WHERE id = $2
++                RETURNING coins
++            "#,
++            delta as i64,
++            user_id
++        )
++        .fetch_one(&mut **tx)
++        .await?;
++
++        Ok(record.coins)
++    }
++
++    async fn record_transaction(
++        tx: &mut Transaction<'_, Postgres>,
++        user_id: &Uuid,
++        amount: i32,
++        source: &str,
++        reference: Option<String>,
++    ) -> ModelResult<Self> {
++        let transaction = query_as!(
++            Self,
++            r#"
++                INSERT INTO coin_transactions (
++                    user_id,
++                    amount,
++                    source,
++                    reference
++                )
++                VALUES ($1, $2, $3, $4)
++                RETURNING id::text, user_id::text, amount, source, reference, created_at
++            "#,
++            user_id,
++            amount as i64,
++            source,
++            reference
++        )
++        .fetch_one(&mut **tx)
++        .await?;
++
++        Ok(transaction)
++    }
++}
+diff --git a/crates/database/src/models/community.rs b/crates/database/src/models/community.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d655f55084ba7e12ea27b2c3fd86ff7ee475ae1d
+--- /dev/null
++++ b/crates/database/src/models/community.rs
+@@ -0,0 +1,209 @@
++use chrono::NaiveDateTime;
++use serde::Serialize;
++use sqlx::{FromRow, query_as};
++use uuid::Uuid;
++
++use crate::db;
++use crate::utils::error::{DatabaseError, ModelResult};
++
++#[derive(FromRow)]
++pub struct CommunityModel {
++    id: Uuid,
++    owner_id: Uuid,
++    name: String,
++    width: i32,
++    height: i32,
++    is_public: bool,
++    billing_plan: String,
++    created_at: NaiveDateTime,
++}
++
++#[derive(Deserialize)]
++pub struct CommunityCreation {
++    #[serde(default)]
++    pub owner_id: String,
++    pub name: String,
++    pub width: Option<i32>,
++    pub height: Option<i32>,
++    pub is_public: Option<bool>,
++    pub billing_plan: Option<String>,
++}
++
++#[derive(Serialize)]
++pub struct CommunityResult {
++    pub id: String,
++    pub owner_id: String,
++    pub name: String,
++    pub width: i32,
++    pub height: i32,
++    pub is_public: bool,
++    pub billing_plan: String,
++    pub created_at: NaiveDateTime,
++}
++
++#[derive(FromRow, Serialize)]
++pub struct CommunityMembershipResult {
++    pub community_id: String,
++    pub user_id: String,
++    pub role: String,
++    pub joined_at: NaiveDateTime,
++}
++
++#[derive(Deserialize)]
++pub struct MembershipCreation {
++    pub community_id: String,
++    pub user_id: String,
++    pub role: Option<String>,
++}
++
++impl CommunityModel {
++    pub async fn create_new(creation: CommunityCreation) -> ModelResult<Self> {
++        let owner_id = Uuid::parse_str(&creation.owner_id)?;
++
++        let community = query_as!(
++            Self,
++            r#"
++                INSERT INTO communities (
++                    owner_id,
++                    name,
++                    width,
++                    height,
++                    is_public,
++                    billing_plan
++                )
++                VALUES ($1, $2, COALESCE($3, 512), COALESCE($4, 512), COALESCE($5, FALSE), COALESCE($6, 'free'))
++                RETURNING *
++            "#,
++            owner_id,
++            creation.name,
++            creation.width,
++            creation.height,
++            creation.is_public,
++            creation.billing_plan,
++        )
++        .fetch_one(db!())
++        .await?;
++
++        Ok(community)
++    }
++
++    pub async fn get_by_id(community_id: &str) -> ModelResult<Self> {
++        let community = query_as!(
++            Self,
++            r#"
++                SELECT *
++                FROM communities
++                WHERE id = $1
++            "#,
++            Uuid::parse_str(community_id)?
++        )
++        .fetch_optional(db!())
++        .await?
++        .ok_or(DatabaseError::ModelNotFound("community"))?;
++
++        Ok(community)
++    }
++
++    pub async fn list_for_user(user_id: &str) -> ModelResult<Vec<Self>> {
++        let communities = query_as!(
++            Self,
++            r#"
++                SELECT c.*
++                FROM communities c
++                INNER JOIN community_members m ON m.community_id = c.id
++                WHERE m.user_id = $1
++                UNION
++                SELECT *
++                FROM communities c
++                WHERE c.owner_id = $1
++            "#,
++            Uuid::parse_str(user_id)?
++        )
++        .fetch_all(db!())
++        .await?;
++
++        Ok(communities)
++    }
++
++    pub fn to_result(&self) -> CommunityResult {
++        CommunityResult {
++            id: self.id.to_string(),
++            owner_id: self.owner_id.to_string(),
++            name: self.name.clone(),
++            width: self.width,
++            height: self.height,
++            is_public: self.is_public,
++            billing_plan: self.billing_plan.clone(),
++            created_at: self.created_at,
++        }
++    }
++}
++
++impl CommunityMembershipResult {
++    pub async fn create_new(creation: MembershipCreation) -> ModelResult<Self> {
++        let membership = query_as!(
++            Self,
++            r#"
++                INSERT INTO community_members (
++                    community_id,
++                    user_id,
++                    role
++                )
++                VALUES ($1, $2, COALESCE($3, 'member'))
++                ON CONFLICT (community_id, user_id) DO UPDATE SET
++                    role = COALESCE(EXCLUDED.role, community_members.role)
++                RETURNING community_id::text, user_id::text, role, joined_at
++            "#,
++            Uuid::parse_str(&creation.community_id)?,
++            Uuid::parse_str(&creation.user_id)?,
++            creation.role
++        )
++        .fetch_one(db!())
++        .await?;
++
++        Ok(membership)
++    }
++
++    pub async fn list_for_community(community_id: &str) -> ModelResult<Vec<Self>> {
++        let members = query_as!(
++            Self,
++            r#"
++                SELECT community_id::text, user_id::text, role, joined_at
++                FROM community_members
++                WHERE community_id = $1
++            "#,
++            Uuid::parse_str(community_id)?
++        )
++        .fetch_all(db!())
++        .await?;
++
++        Ok(members)
++    }
++
++    pub async fn require_role(
++        community_id: &str,
++        user_id: &str,
++        expected_roles: &[&str],
++    ) -> ModelResult<()> {
++        let membership = query_as!(
++            Self,
++            r#"
++                SELECT community_id::text, user_id::text, role, joined_at
++                FROM community_members
++                WHERE community_id = $1 AND user_id = $2
++            "#,
++            Uuid::parse_str(community_id)?,
++            Uuid::parse_str(user_id)?
++        )
++        .fetch_optional(db!())
++        .await?;
++
++        if let Some(member) = membership {
++            if expected_roles.iter().any(|role| role.eq_ignore_ascii_case(&member.role)) {
++                return Ok(());
++            }
++        }
++
++        Err(DatabaseError::ModelNotFound("membership"))
++    }
++}
+diff --git a/crates/database/src/models/mod.rs b/crates/database/src/models/mod.rs
+index fc1622dbc5feab725e4cc8265d9914d747a12dd4..6e7dced102fb8c082d4c66df547bf9b596d988f9 100644
+--- a/crates/database/src/models/mod.rs
++++ b/crates/database/src/models/mod.rs
+@@ -1,7 +1,11 @@
+ mod avatar;
++mod coins;
++mod community;
+ mod pixel;
+ mod user;
+ 
+ pub use avatar::*;
++pub use coins::*;
++pub use community::*;
+ pub use pixel::*;
+ pub use user::*;
+diff --git a/crates/database/src/models/pixel.rs b/crates/database/src/models/pixel.rs
+index 163c4036ed7f39ec37eb19d28fb7e6b28281d0cf..599cbb580e82fc6358702626e776817dd9185b05 100644
+--- a/crates/database/src/models/pixel.rs
++++ b/crates/database/src/models/pixel.rs
+@@ -1,107 +1,192 @@
+ use chrono::NaiveDateTime;
+-use serde::Serialize;
++use serde::{Deserialize, Serialize};
+ use sqlx::{FromRow, query_as};
+ use uuid::Uuid;
+ 
++use crate::CoinTransactionResult;
+ use crate::db;
+ use crate::utils::error::ModelResult;
+ 
+ /// Represents a pixel entry in the database
+ #[derive(FromRow)]
+ pub struct PixelModel {
++    /// ID of the community/canvas the pixel belongs to
++    community_id: Option<Uuid>,
++
+     /// X coordinate of the pixel
+     x: i64,
+ 
+     /// Y coordinate of the pixel
+     y: i64,
+ 
+     /// ID of the user who placed the pixel
+     user_id: Uuid,
+ 
+     /// Color of the pixel as a 32-bit integer (hexadecimal representation)
+     color: i32,
+ 
+     /// Timestamp when the pixel was placed
+     placed_at: NaiveDateTime,
+ }
+ 
+ /// Represents the data required to create a new pixel entry
+ #[derive(Deserialize)]
+ pub struct PixelCreation {
+     /// A list of pixel data where:
+     /// - First element is the x coordinate
+     /// - Second element is the y coordinate
+     /// - Third element is the color as a 32-bit integer (hexadecimal representation)
+-    pixels: Vec<[i64; 3]>,
++    pub pixels: Vec<[i64; 3]>,
+ 
+     /// ID of the user who is creating the pixel entry (as a string)
+-    user_id: String,
++    pub user_id: String,
++
++    /// Optional community/canvas identifier for scoping the draw action
++    pub community_id: Option<String>,
+ }
+ 
+ /// Represents the result of a pixel operation
+-#[derive(Serialize)]
++#[derive(Serialize, Clone)]
+ pub struct PixelResult {
++    /// The community/canvas identifier when present
++    pub community_id: Option<String>,
++
+     /// X coordinate of the pixel
+-    x: i64,
++    pub x: i64,
+ 
+     /// Y coordinate of the pixel
+-    y: i64,
++    pub y: i64,
+ 
+     /// uuid of the user who placed the pixel (as a string)
+-    user_id: String,
++    pub user_id: String,
+ 
+     /// Color of the pixel as a 32-bit integer (hexadecimal representation)
+-    color: i32,
++    pub color: i32,
+ }
+ 
+ impl PixelModel {
+     /// Creates a new pixel entry in the database
+     ///
+     /// # Arguments
+     ///
+     /// * `creation` - The data required to create the pixel
+     ///
+     /// # Returns
+     ///
+     /// A result containing the created `PixelModel` or a database error
+     pub async fn create_new(creation: PixelCreation) -> ModelResult<Vec<PixelResult>> {
+         let mut conn = db!().begin().await?;
+ 
+         let mut pixel_results = Vec::new();
++        let community_id =
++            creation.community_id.as_ref().map(|id| Uuid::parse_str(id)).transpose()?;
++        let user_id = Uuid::parse_str(&creation.user_id)?;
++        let reward = creation.pixels.len() as i32;
++
+         for [x, y, color] in creation.pixels {
+             let pixel_result = query_as!(
+                 PixelResult,
+                 r#"
+-                    INSERT INTO pixels (x, y, user_id, color)
+-                    VALUES ($1, $2, $3, $4)
+-                    ON CONFLICT (x, y) DO UPDATE SET
+-                        user_id = $3,
+-                        color = $4,
++                    INSERT INTO pixels (community_id, x, y, user_id, color)
++                    VALUES ($1, $2, $3, $4, $5)
++                    ON CONFLICT (community_id, x, y) DO UPDATE SET
++                        user_id = $4,
++                        color = $5,
+                         placed_at = NOW()
+-                    RETURNING x, y, user_id, color
++                    RETURNING community_id::text, x, y, user_id, color
+                 "#,
++                community_id,
+                 x as i32,
+                 y as i32,
+-                Uuid::parse_str(&creation.user_id)?,
++                user_id,
+                 color as i32
+             )
+             .fetch_one(&mut *conn)
+             .await?;
+ 
+             pixel_results.push(pixel_result);
+         }
+ 
++        if reward > 0 {
++            let reference = creation
++                .community_id
++                .clone()
++                .map(|id| format!("Placed {} pixels in community {}", reward, id));
++            let _ =
++                CoinTransactionResult::reward_pixels_in_tx(&mut conn, &user_id, reward, reference)
++                    .await?;
++        }
++
+         conn.commit().await?;
+ 
+         Ok(pixel_results)
+     }
+ 
++    pub async fn list_for_community(community_id: &str) -> ModelResult<Vec<PixelResult>> {
++        let pixels = query_as!(
++            PixelResult,
++            r#"
++                SELECT community_id::text, x, y, user_id, color
++                FROM pixels
++                WHERE community_id = $1
++            "#,
++            Uuid::parse_str(community_id)?
++        )
++        .fetch_all(db!())
++        .await?;
++
++        Ok(pixels)
++    }
++
+     pub fn to_result(self) -> PixelResult {
+         PixelResult {
++            community_id: self.community_id.map(|id| id.into()),
+             x: self.x,
+             y: self.y,
+             user_id: self.user_id.into(),
+             color: self.color,
+         }
+     }
++
++    /// Compresses a list of pixels into run-length encoded sequences ordered by row
++    /// to reduce bandwidth during canvas fetches.
++    pub fn compress(pixels: &[PixelResult]) -> Vec<CompressedPixel> {
++        let mut sorted = pixels.to_vec();
++        sorted.sort_by_key(|p| (p.y, p.x));
++
++        let mut compressed = Vec::new();
++        let mut iter = sorted.into_iter().peekable();
++
++        while let Some(pixel) = iter.next() {
++            let mut length = 1;
++            while let Some(next) = iter.peek() {
++                if next.y == pixel.y && next.x == pixel.x + length && next.color == pixel.color {
++                    length += 1;
++                    iter.next();
++                } else {
++                    break;
++                }
++            }
++
++            compressed.push(CompressedPixel {
++                community_id: pixel.community_id.clone(),
++                x: pixel.x,
++                y: pixel.y,
++                run: length,
++                color: pixel.color,
++            });
++        }
++
++        compressed
++    }
++}
++
++/// Run-length encoded pixel sequence used for efficient payloads.
++#[derive(Serialize)]
++pub struct CompressedPixel {
++    pub community_id: Option<String>,
++    pub x: i64,
++    pub y: i64,
++    pub run: i64,
++    pub color: i32,
+ }
+diff --git a/crates/database/src/models/user.rs b/crates/database/src/models/user.rs
+index 34f24f45d141b8524653119614beede2858c0239..a01892dbbe5e2ec9f03288cb7f7ff00448623e7e 100644
+--- a/crates/database/src/models/user.rs
++++ b/crates/database/src/models/user.rs
+@@ -1,111 +1,134 @@
+ use chrono::NaiveDateTime;
+-use serde::Serialize;
++use serde::{Deserialize, Serialize};
+ use sqlx::{FromRow, query_as};
+ use uuid::Uuid;
+ 
+ use crate::db;
+ use crate::utils::error::{DatabaseError, ModelResult};
+ 
+ #[derive(FromRow)]
+ pub struct UserModel {
+     id: Uuid,
+     username: String,
+     level: i32,
+     xp: i32,
++    coins: i64,
+     email: String,
+     created_at: NaiveDateTime,
+ }
+ 
+ #[derive(Deserialize)]
+ pub struct UserCreation {
+-    username: String,
+-    email: String,
++    pub username: String,
++    pub email: String,
+ }
+ 
+ #[derive(serde::Deserialize)]
+ pub struct UserUpdate {
+     username: Option<String>,
+     level: Option<i32>,
+     xp: Option<i32>,
+ }
+ 
+ #[derive(Serialize)]
+ pub struct UserResult {
+     id: String,
+     level: i32,
+     xp: i32,
++    coins: i64,
+     username: String,
+     created_at: NaiveDateTime,
+ }
+ 
+ impl UserModel {
+     pub async fn create_new(creation: UserCreation) -> ModelResult<Self> {
+         let user = query_as!(
+             Self,
+             r#"
+                 INSERT INTO users (
+                     username,
+                     email
+                 )
+                 VALUES ($1, $2)
+                 RETURNING *
+             "#,
+             creation.username,
+             creation.email,
+         )
+         .fetch_one(db!())
+         .await?;
+ 
+         Ok(user)
+     }
+ 
++    pub async fn get_by_email(email: &str) -> ModelResult<Option<Self>> {
++        let user = query_as!(
++            Self,
++            r#"
++                SELECT *
++                FROM users
++                WHERE email = $1
++            "#,
++            email
++        )
++        .fetch_optional(db!())
++        .await?;
++
++        Ok(user)
++    }
++
++    pub fn id(&self) -> String {
++        self.id.to_string()
++    }
++
+     pub async fn get(id: String) -> ModelResult<Self> {
+         let user = query_as!(
+             Self,
+             r#"
+                 SELECT *
+                 FROM users
+                 WHERE
+                     id = $1
+             "#,
+             Uuid::parse_str(&id)?
+         )
+         .fetch_one(db!())
+         .await?;
+ 
+         Ok(user)
+     }
+ 
+     pub async fn edit(&self, update: UserUpdate) -> ModelResult<Self> {
+         query_as!(
+             Self,
+             r#"
+                 UPDATE users
+                 SET
+                     username = COALESCE($1, username),
+                     level = COALESCE($2, level),
+                     xp = COALESCE($3, xp)
+                 WHERE
+                     id = $4
+                 RETURNING *
+             "#,
+             update.username,
+             update.level,
+             update.xp,
+             self.id
+         )
+         .fetch_optional(db!())
+         .await?
+         .ok_or(DatabaseError::ModelNotFound("user"))
+     }
+ 
+     pub fn to_result(&self) -> UserResult {
+         UserResult {
+             id: self.id.into(),
+             username: self.username.clone(),
+             level: self.level,
+             xp: self.xp,
++            coins: self.coins,
+             created_at: self.created_at,
+         }
+     }
+ }
+diff --git a/crates/database/src/utils/error.rs b/crates/database/src/utils/error.rs
+index d39bc1950a68d6b83785dd3a0ca306f5ae3ed71c..ca29bce58abf6153711250d15870fa087c6a8b34 100644
+--- a/crates/database/src/utils/error.rs
++++ b/crates/database/src/utils/error.rs
+@@ -3,26 +3,30 @@ use sqlx::Error as SqlxError;
+ use thiserror::Error as ThisError;
+ 
+ use super::connection::DatabaseConnectionError;
+ 
+ pub type ModelResult<T> = Result<T, DatabaseError>;
+ 
+ #[derive(ThisError, Debug, ErrorResponse)]
+ pub enum DatabaseError {
+     #[error("{0:#}")]
+     DatabaseQuery(#[from] SqlxError),
+ 
+     #[error("{0:#}")]
+     DatabaseConnectionError(#[from] DatabaseConnectionError),
+ 
+     #[status_code(NotFound)]
+     #[error("No {0} found with that query.")]
+     ModelNotFound(&'static str),
+ 
+     #[status_code(BadRequest)]
+     #[error("Failed to parse UUID: {0}")]
+     UuidParseError(#[from] uuid::Error),
+ 
+     #[status_code(BadRequest)]
+     #[error("Failed to parse JSON: {0}")]
+     JsonParseError(#[from] serde_json::Error),
++
++    #[status_code(BadRequest)]
++    #[error("Invalid input: {0}")]
++    InvalidInput(&'static str),
+ }
+diff --git a/migrations/20251011120000_add_communities_and_canvas.down.sql b/migrations/20251011120000_add_communities_and_canvas.down.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..e75199e4ab57406d11a7cc51b03bea1c2ea82873
+--- /dev/null
++++ b/migrations/20251011120000_add_communities_and_canvas.down.sql
+@@ -0,0 +1,7 @@
++DROP INDEX IF EXISTS idx_pixels_community;
++ALTER TABLE pixels DROP CONSTRAINT IF EXISTS pixel_pkey;
++ALTER TABLE pixels DROP COLUMN IF EXISTS community_id;
++ALTER TABLE pixels ADD CONSTRAINT pixel_pkey PRIMARY KEY (x, y);
++
++DROP TABLE IF EXISTS community_members;
++DROP TABLE IF EXISTS communities;
+diff --git a/migrations/20251011120000_add_communities_and_canvas.up.sql b/migrations/20251011120000_add_communities_and_canvas.up.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..f72bb4fef0745da5599e9e5d666cb1f0c77f71ea
+--- /dev/null
++++ b/migrations/20251011120000_add_communities_and_canvas.up.sql
+@@ -0,0 +1,27 @@
++CREATE EXTENSION IF NOT EXISTS pgcrypto;
++
++CREATE TABLE IF NOT EXISTS communities (
++    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    name TEXT NOT NULL,
++    width INT NOT NULL DEFAULT 512,
++    height INT NOT NULL DEFAULT 512,
++    is_public BOOLEAN NOT NULL DEFAULT FALSE,
++    billing_plan TEXT NOT NULL DEFAULT 'free',
++    created_at TIMESTAMP NOT NULL DEFAULT NOW()
++);
++
++CREATE TABLE IF NOT EXISTS community_members (
++    community_id UUID NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    role TEXT NOT NULL DEFAULT 'member',
++    joined_at TIMESTAMP NOT NULL DEFAULT NOW(),
++    PRIMARY KEY (community_id, user_id)
++);
++
++ALTER TABLE users ALTER COLUMN id SET DEFAULT gen_random_uuid();
++
++ALTER TABLE pixels ADD COLUMN IF NOT EXISTS community_id UUID REFERENCES communities(id) ON DELETE CASCADE;
++ALTER TABLE pixels DROP CONSTRAINT IF EXISTS pixel_pkey;
++ALTER TABLE pixels ADD CONSTRAINT pixel_pkey PRIMARY KEY (community_id, x, y);
++CREATE INDEX IF NOT EXISTS idx_pixels_community ON pixels (community_id);
+diff --git a/migrations/20251011121000_add_coin_wallet.down.sql b/migrations/20251011121000_add_coin_wallet.down.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4522f8aebb0f9413bbafb4e2debaff1c49e3d1e
+--- /dev/null
++++ b/migrations/20251011121000_add_coin_wallet.down.sql
+@@ -0,0 +1,3 @@
++DROP INDEX IF EXISTS idx_coin_transactions_user;
++DROP TABLE IF EXISTS coin_transactions;
++ALTER TABLE users DROP COLUMN IF EXISTS coins;
+diff --git a/migrations/20251011121000_add_coin_wallet.up.sql b/migrations/20251011121000_add_coin_wallet.up.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..b69493f11d9dcffd233e22d606a89c360f37399e
+--- /dev/null
++++ b/migrations/20251011121000_add_coin_wallet.up.sql
+@@ -0,0 +1,12 @@
++ALTER TABLE users ADD COLUMN IF NOT EXISTS coins BIGINT NOT NULL DEFAULT 0;
++
++CREATE TABLE IF NOT EXISTS coin_transactions (
++    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++    amount BIGINT NOT NULL,
++    source TEXT NOT NULL,
++    reference TEXT,
++    created_at TIMESTAMP NOT NULL DEFAULT NOW()
++);
++
++CREATE INDEX IF NOT EXISTS idx_coin_transactions_user ON coin_transactions(user_id);
+diff --git a/server/Cargo.toml b/server/Cargo.toml
+index 7a57d91d7174bebf9562826bb2779826d6f29acc..1440926495d6c808e9bbd37253edaf21b47e02e9 100644
+--- a/server/Cargo.toml
++++ b/server/Cargo.toml
+@@ -1,24 +1,29 @@
+ [package]
+ name = "server"
+ version = "0.1.0"
+ edition = "2024"
+ 
+ [dependencies]
+ thiserror.workspace = true
+ actix-web.workspace = true
+ actix_failwrap.workspace = true
+ flexi_logger.workspace = true
+ oauth2 = "5.0.0"
+ actix-identity = "0.8.0"
++actix-session = { version = "0.10.1", features = ["cookie-session"] }
+ eserde.workspace = true
++reqwest.workspace = true
++uuid.workspace = true
++
++serde.workspace = true
+ 
+ [dependencies.macros_utils]
+ path = "../crates/macros_utils"
+ default-features = false
+ features = ["actix"]
+ 
+ [dependencies.logger]
+ path = "../crates/logger"
+ 
+ [dependencies.database]
+ path = "../crates/database"
+diff --git a/server/src/bin/server.rs b/server/src/bin/server.rs
+index c416d8fe20f0c2dd62d0a239d70d942b55308d8f..1d60eefc0759178bb97a7d40eaa9125b26948df4 100644
+--- a/server/src/bin/server.rs
++++ b/server/src/bin/server.rs
+@@ -1,24 +1,44 @@
++use actix_identity::IdentityMiddleware;
++use actix_session::{
++    SessionMiddleware, config::CookieContentSecurity, storage::CookieSessionStore,
++};
++use actix_web::cookie::Key;
+ use actix_web::web::get;
+-use actix_web::{App, HttpResponse, HttpServer};
++use actix_web::{App, HttpResponse, HttpServer, web};
+ use flexi_logger::Logger;
+ use logger::format_log;
+-use server::{AppError, routes};
++use server::{AppError, config::AppConfig, routes, state::AppState};
+ 
+ #[actix_web::main]
+ async fn main() -> Result<(), AppError> {
+     Logger::try_with_str("info")? //
+         .format(format_log)
+         .log_to_stdout()
+         .start()?;
+ 
+-    HttpServer::new(|| {
++    let config = AppConfig::from_env()?;
++    let oauth_client = config.oauth_client();
++    let cookie_key = config.cookie_key.clone();
++
++    HttpServer::new(move || {
++        let state = AppState::new(oauth_client.clone());
++        let session_middleware =
++            SessionMiddleware::builder(CookieSessionStore::default(), cookie_key.clone())
++                .cookie_http_only(true)
++                .cookie_secure(false)
++                .cookie_content_security(CookieContentSecurity::Private)
++                .build();
++
+         App::new() //
++            .app_data(web::Data::new(state.clone()))
++            .wrap(IdentityMiddleware::builder().build())
++            .wrap(session_middleware)
+             .route("/", get().to(HttpResponse::Ok))
+             .configure(routes::routes)
+     })
+     .bind(("0.0.0.0", 8080))?
+     .run()
+     .await?;
+ 
+     Ok(())
+ }
+diff --git a/server/src/config.rs b/server/src/config.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..171e8619127de4d51bce54cd59c3e7d93de674c6
+--- /dev/null
++++ b/server/src/config.rs
+@@ -0,0 +1,57 @@
++use actix_web::cookie::Key;
++use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl, basic::BasicClient};
++use std::env;
++
++use crate::AppError;
++
++#[derive(Clone)]
++pub struct DiscordConfig {
++    pub client_id: ClientId,
++    pub client_secret: ClientSecret,
++    pub redirect_url: RedirectUrl,
++    pub auth_url: AuthUrl,
++    pub token_url: TokenUrl,
++}
++
++#[derive(Clone)]
++pub struct AppConfig {
++    pub discord: DiscordConfig,
++    pub cookie_key: Key,
++}
++
++impl AppConfig {
++    pub fn from_env() -> Result<Self, AppError> {
++        let client_id = ClientId::new(env::var("DISCORD_CLIENT_ID")?);
++        let client_secret = ClientSecret::new(env::var("DISCORD_CLIENT_SECRET")?);
++        let redirect_url = RedirectUrl::new(env::var("DISCORD_REDIRECT_URL")?)?;
++
++        let auth_url = AuthUrl::new("https://discord.com/api/oauth2/authorize".to_string())?;
++        let token_url = TokenUrl::new("https://discord.com/api/oauth2/token".to_string())?;
++
++        let cookie_key = env::var("COOKIE_SECRET")
++            .ok()
++            .map(|secret| Key::from(secret.as_bytes()))
++            .unwrap_or_else(|| Key::generate());
++
++        Ok(Self {
++            discord: DiscordConfig {
++                client_id,
++                client_secret,
++                redirect_url,
++                auth_url,
++                token_url,
++            },
++            cookie_key,
++        })
++    }
++
++    pub fn oauth_client(&self) -> BasicClient {
++        BasicClient::new(
++            self.discord.client_id.clone(),
++            Some(self.discord.client_secret.clone()),
++            self.discord.auth_url.clone(),
++            Some(self.discord.token_url.clone()),
++        )
++        .set_redirect_uri(self.discord.redirect_url.clone())
++    }
++}
+diff --git a/server/src/lib.rs b/server/src/lib.rs
+index ed4adca2f400b96158ff9aca157922d11a19c383..1dc39cb5e74368a2a2f0301420a07a41839c146d 100644
+--- a/server/src/lib.rs
++++ b/server/src/lib.rs
+@@ -1,20 +1,44 @@
++use std::env::VarError;
+ use std::io::Error as IoError;
+ 
+ use actix_failwrap::ErrorResponse;
+ use flexi_logger::FlexiLoggerError;
++use oauth2::RequestTokenError;
++use oauth2::url::ParseError as UrlParseError;
++use reqwest::Error as ReqwestError;
+ use thiserror::Error as ThisError;
+ 
++use database::utils::error::DatabaseError;
++
++pub mod config;
+ pub mod routes;
++pub mod state;
+ 
+ #[derive(Debug, ThisError, ErrorResponse)]
+ pub enum AppError {
+     #[error("{0:#}")]
+     Io(#[from] IoError),
+ 
++    #[error("{0:#}")]
++    HttpClient(#[from] ReqwestError),
++
++    #[error("{0:#}")]
++    Oauth(#[from] RequestTokenError<ReqwestError>),
++
++    #[error("{0:#}")]
++    Database(#[from] DatabaseError),
++
+     #[error("0:#")]
+     LoggerError(#[from] FlexiLoggerError),
+ 
++    #[error("{0:#}")]
++    UrlParse(#[from] UrlParseError),
++
++    #[status_code(BadRequest)]
++    #[error("Invalid configuration: {0}")]
++    BadConfig(#[from] VarError),
++
+     #[status_code(Unauthorized)]
+     #[error("You are not authorized to access this resource")]
+     AuthorizationError,
+ }
+diff --git a/server/src/routes/auth/discord.rs b/server/src/routes/auth/discord.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..afd07eaba66dacc299785805f77f63d6e5911e1a
+--- /dev/null
++++ b/server/src/routes/auth/discord.rs
+@@ -0,0 +1,102 @@
++use actix_identity::Identity;
++use actix_web::{HttpRequest, HttpResponse, cookie::Cookie, get, web};
++use oauth2::reqwest::async_http_client;
++use oauth2::{AuthorizationCode, CsrfToken, Scope};
++use serde::Deserialize;
++
++use database::{UserCreation, UserModel};
++
++use crate::AppError;
++use crate::state::AppState;
++
++#[derive(Deserialize)]
++pub struct DiscordCallbackQuery {
++    code: String,
++    state: String,
++}
++
++#[derive(Deserialize)]
++pub struct DiscordUser {
++    id: String,
++    username: String,
++    email: Option<String>,
++}
++
++macros_utils::routes! {
++    route discord_login,
++    route discord_callback,
++    route discord_logout,
++
++    on "/discord"
++}
++
++#[get("/login")]
++pub async fn discord_login(data: web::Data<AppState>) -> Result<HttpResponse, AppError> {
++    let (auth_url, csrf) = data
++        .oauth
++        .authorize_url(CsrfToken::new_random)
++        .add_scope(Scope::new("identify".to_string()))
++        .add_scope(Scope::new("email".to_string()))
++        .url();
++
++    let cookie = Cookie::build("discord_oauth_state", csrf.secret().clone())
++        .path("/")
++        .http_only(true)
++        .finish();
++
++    Ok(HttpResponse::Found()
++        .append_header(("Location", auth_url.to_string()))
++        .cookie(cookie)
++        .finish())
++}
++
++#[get("/callback")]
++pub async fn discord_callback(
++    data: web::Data<AppState>,
++    identity: Identity,
++    query: web::Query<DiscordCallbackQuery>,
++    request: HttpRequest,
++) -> Result<HttpResponse, AppError> {
++    if let Some(state_cookie) = request.cookie("discord_oauth_state") {
++        if state_cookie.value() != query.state {
++            return Err(AppError::AuthorizationError);
++        }
++    } else {
++        return Err(AppError::AuthorizationError);
++    }
++
++    let token = data
++        .oauth
++        .exchange_code(AuthorizationCode::new(query.code.clone()))
++        .request_async(async_http_client)
++        .await?;
++
++    let user: DiscordUser = data
++        .http_client
++        .get("https://discord.com/api/users/@me")
++        .bearer_auth(token.access_token().secret())
++        .send()
++        .await?
++        .json()
++        .await?;
++
++    let email = user.email.clone().unwrap_or_else(|| format!("{}@discord", user.id));
++    let username = user.username;
++
++    let db_user = if let Some(existing) = UserModel::get_by_email(&email).await? {
++        existing
++    } else {
++        UserModel::create_new(UserCreation { username, email }).await?
++    };
++
++    let user_id = db_user.id();
++    identity.remember(user_id);
++
++    Ok(HttpResponse::Ok().json(db_user.to_result()))
++}
++
++#[get("/logout")]
++pub async fn discord_logout(identity: Identity) -> Result<HttpResponse, AppError> {
++    identity.forget();
++    Ok(HttpResponse::Ok().finish())
++}
+diff --git a/server/src/routes/auth/mod.rs b/server/src/routes/auth/mod.rs
+index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..ea2ffbfb41e563ddb7f8374d902fbc9026812bf0 100644
+--- a/server/src/routes/auth/mod.rs
++++ b/server/src/routes/auth/mod.rs
+@@ -0,0 +1,7 @@
++mod discord;
++
++macros_utils::routes! {
++    load discord,
++
++    on "/auth"
++}
+diff --git a/server/src/routes/canvas/mod.rs b/server/src/routes/canvas/mod.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..de97029fd157e623998b010044090e05db05420c
+--- /dev/null
++++ b/server/src/routes/canvas/mod.rs
+@@ -0,0 +1,51 @@
++use actix_identity::Identity;
++use actix_web::{HttpResponse, get, post, web};
++
++use database::{CommunityMembershipResult, CompressedPixel, PixelCreation, PixelModel};
++
++use crate::AppError;
++
++macros_utils::routes! {
++    route place_pixels,
++    route fetch_canvas,
++
++    on "/canvas"
++}
++
++fn require_identity(identity: &Identity) -> Result<String, AppError> {
++    identity.id().map_err(|_| AppError::AuthorizationError)?.ok_or(AppError::AuthorizationError)
++}
++
++#[post("/{community_id}")]
++pub async fn place_pixels(
++    path: web::Path<String>,
++    payload: web::Json<PixelCreation>,
++    identity: Identity,
++) -> Result<HttpResponse, AppError> {
++    let user_id = require_identity(&identity)?;
++    let community_id = path.into_inner();
++
++    CommunityMembershipResult::require_role(&community_id, &user_id, &["owner", "member"]).await?;
++
++    let mut creation = payload.into_inner();
++    creation.user_id = user_id;
++    creation.community_id = Some(community_id.clone());
++
++    let pixels = PixelModel::create_new(creation).await?;
++    Ok(HttpResponse::Ok().json(pixels))
++}
++
++#[get("/{community_id}")]
++pub async fn fetch_canvas(
++    path: web::Path<String>,
++    identity: Identity,
++) -> Result<HttpResponse, AppError> {
++    let community_id = path.into_inner();
++    let user_id = require_identity(&identity)?;
++
++    CommunityMembershipResult::require_role(&community_id, &user_id, &["owner", "member"]).await?;
++
++    let pixels = PixelModel::list_for_community(&community_id).await?;
++    let compressed: Vec<CompressedPixel> = PixelModel::compress(&pixels);
++    Ok(HttpResponse::Ok().json(compressed))
++}
+diff --git a/server/src/routes/community/mod.rs b/server/src/routes/community/mod.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d92474e482bee8cb123fc06497c6344c61c0e4c3
+--- /dev/null
++++ b/server/src/routes/community/mod.rs
+@@ -0,0 +1,82 @@
++use actix_identity::Identity;
++use actix_web::{HttpResponse, get, post, web};
++
++use database::{CommunityCreation, CommunityMembershipResult, CommunityModel, MembershipCreation};
++
++use crate::AppError;
++
++macros_utils::routes! {
++    route create_community,
++    route list_user_communities,
++    route invite_member,
++    route list_members,
++
++    on "/communities"
++}
++
++fn require_identity(identity: &Identity) -> Result<String, AppError> {
++    identity.id().map_err(|_| AppError::AuthorizationError)?.ok_or(AppError::AuthorizationError)
++}
++
++#[post("")]
++pub async fn create_community(
++    payload: web::Json<CommunityCreation>,
++    identity: Identity,
++) -> Result<HttpResponse, AppError> {
++    let user_id = require_identity(&identity)?;
++
++    let mut creation = payload.into_inner();
++    creation.owner_id = user_id.clone();
++
++    let community = CommunityModel::create_new(creation).await?;
++
++    CommunityMembershipResult::create_new(MembershipCreation {
++        community_id: community.id.to_string(),
++        user_id,
++        role: Some("owner".to_string()),
++    })
++    .await?;
++
++    Ok(HttpResponse::Created().json(community.to_result()))
++}
++
++#[get("")]
++pub async fn list_user_communities(identity: Identity) -> Result<HttpResponse, AppError> {
++    let user_id = require_identity(&identity)?;
++    let communities = CommunityModel::list_for_user(&user_id).await?;
++
++    let response: Vec<_> = communities.into_iter().map(|c| c.to_result()).collect();
++    Ok(HttpResponse::Ok().json(response))
++}
++
++#[post("/{community_id}/members")]
++pub async fn invite_member(
++    path: web::Path<String>,
++    payload: web::Json<MembershipCreation>,
++    identity: Identity,
++) -> Result<HttpResponse, AppError> {
++    let user_id = require_identity(&identity)?;
++    let community_id = path.into_inner();
++
++    CommunityMembershipResult::require_role(&community_id, &user_id, &["owner"]).await?;
++
++    let mut creation = payload.into_inner();
++    creation.community_id = community_id.clone();
++
++    let member = CommunityMembershipResult::create_new(creation).await?;
++    Ok(HttpResponse::Created().json(member))
++}
++
++#[get("/{community_id}/members")]
++pub async fn list_members(
++    path: web::Path<String>,
++    identity: Identity,
++) -> Result<HttpResponse, AppError> {
++    let user_id = require_identity(&identity)?;
++    let community_id = path.into_inner();
++
++    CommunityMembershipResult::require_role(&community_id, &user_id, &["owner", "member"]).await?;
++
++    let members = CommunityMembershipResult::list_for_community(&community_id).await?;
++    Ok(HttpResponse::Ok().json(members))
++}
+diff --git a/server/src/routes/mod.rs b/server/src/routes/mod.rs
+index e27ad2e1bd1dd0527e98205ea55e352df8563f24..7042e0340b0687a03283d5e7227680d76151095c 100644
+--- a/server/src/routes/mod.rs
++++ b/server/src/routes/mod.rs
+@@ -1,6 +1,15 @@
+ mod auth;
++mod canvas;
++mod community;
+ mod hello;
++mod payments;
+ 
+ macros_utils::routes! {
++    load auth,
++    load community,
++    load canvas,
++    load payments,
+     load hello,
++
++    on "/api"
+ }
+diff --git a/server/src/routes/payments/mod.rs b/server/src/routes/payments/mod.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a196bbd25f8211daf04d7523285fe2112deb91c3
+--- /dev/null
++++ b/server/src/routes/payments/mod.rs
+@@ -0,0 +1,57 @@
++use actix_identity::Identity;
++use actix_web::{HttpResponse, get, post, web};
++
++use database::{CoinTransactionResult, PurchaseCoinsRequest};
++
++use crate::AppError;
++
++macros_utils::routes! {
++    route purchase_coins,
++    route balance,
++    route transactions,
++
++    on "/payments"
++}
++
++fn require_identity(identity: &Identity) -> Result<String, AppError> {
++    identity.id().map_err(|_| AppError::AuthorizationError)?.ok_or(AppError::AuthorizationError)
++}
++
++#[post("/purchase")]
++pub async fn purchase_coins(
++    payload: web::Json<PurchaseCoinsRequest>,
++    identity: Identity,
++) -> Result<HttpResponse, AppError> {
++    let user_id = require_identity(&identity)?;
++    let (transaction, balance) =
++        CoinTransactionResult::apply_purchase(&user_id, payload.into_inner()).await?;
++
++    Ok(HttpResponse::Ok().json(PurchaseResponse { transaction, balance }))
++}
++
++#[get("/balance")]
++pub async fn balance(identity: Identity) -> Result<HttpResponse, AppError> {
++    let user_id = require_identity(&identity)?;
++    let balance = CoinTransactionResult::balance_for_user(&user_id).await?;
++
++    Ok(HttpResponse::Ok().json(BalanceResponse { coins: balance }))
++}
++
++#[get("/transactions")]
++pub async fn transactions(identity: Identity) -> Result<HttpResponse, AppError> {
++    let user_id = require_identity(&identity)?;
++    let transactions = CoinTransactionResult::list_for_user(&user_id).await?;
++
++    Ok(HttpResponse::Ok().json(transactions))
++}
++
++#[derive(serde::Serialize)]
++pub struct PurchaseResponse {
++    pub transaction: CoinTransactionResult,
++    pub balance: i64,
++}
++
++#[derive(serde::Serialize)]
++pub struct BalanceResponse {
++    pub coins: i64,
++}
+diff --git a/server/src/state.rs b/server/src/state.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ce1528f537eca26eb7c78e81233c557766ef354
+--- /dev/null
++++ b/server/src/state.rs
+@@ -0,0 +1,14 @@
++use oauth2::basic::BasicClient;
++use reqwest::Client;
++
++#[derive(Clone)]
++pub struct AppState {
++    pub oauth: BasicClient,
++    pub http_client: Client,
++}
++
++impl AppState {
++    pub fn new(oauth: BasicClient) -> Self {
++        Self { oauth, http_client: Client::new() }
++    }
++}
+ 
+EOF
+)

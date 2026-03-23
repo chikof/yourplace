@@ -7,6 +7,10 @@ members = ["crates/*", "server"]
 dotenvy = "0.15.7"
 chrono = { version = "0.4.41", features = ["serde"] }
 thiserror = "2.0.15"
+uuid = { version = "1.10.0", features = ["v4", "v5", "serde"] }
+
+# Networking
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Serde
 eserde = { version = "0.1.7", features = ["json"] }

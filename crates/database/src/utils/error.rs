@@ -25,4 +25,8 @@ pub enum DatabaseError {
     #[status_code(BadRequest)]
     #[error("Failed to parse JSON: {0}")]
     JsonParseError(#[from] serde_json::Error),
+
+    #[status_code(BadRequest)]
+    #[error("Invalid input: {0}")]
+    InvalidInput(&'static str),
 }
